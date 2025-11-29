@@ -1355,11 +1355,16 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    # Retrieve async reward computation BEFORE advantage timing
+                    if self.config.reward_model.launch_reward_fn_async:
+                        with marked_timer("reward_wait", timing_raw, color="cyan"):
+                            # NOTE(sgm): the reward computation result is a future object
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                             if "rm_scores" in batch.batch:
                                 rm_scores = batch.batch["rm_scores"]
                                 reward_tensor = reward_tensor + rm_weight * rm_scores

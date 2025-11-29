@@ -37,7 +37,7 @@ fi
 
 # Force using local model path only; fail fast if missing (no HF fallback)
 MODEL_PATH="${MODEL_PATH:-/data/wzh/wzh/models/qwen/Qwen2.5-VL-7B-Instruct}"
-OUTPUT_DIR="${OUTPUT_DIR:-$WORKDIR/outputs/qwen25vl7b_car}"
+OUTPUT_DIR="${OUTPUT_DIR:-$WORKDIR/outputs/qwen25vl7b_grpo}"
 
 if [[ ! -d "$MODEL_PATH" ]]; then
   echo "Local model directory not found: $MODEL_PATH" >&2

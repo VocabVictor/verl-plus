@@ -126,3 +126,6 @@ logs
 log
 outputs
 .history
+
+# Local demo scripts
+scripts/demo/
