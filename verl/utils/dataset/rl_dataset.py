@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
+import json
 import logging
 import os
 import re
@@ -27,11 +29,266 @@ import torch
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
+from tqdm import tqdm
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
+
+
+async def _answer_question_async(
+    client,
+    model: str,
+    question_message: str,
+    system_prompt: str,
+    temperature: float = 0.0,
+    max_tokens: int = 256,
+    timeout: float = 60.0,
+    max_retries: int = 2,
+) -> Optional[str]:
+    """Call OpenAI API to answer a question (without caption) for caching."""
+    for attempt in range(max_retries + 1):
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": question_message},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
+                timeout=timeout,
+            )
+            return response.choices[0].message.content.strip()
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout answering question (attempt {attempt + 1}/{max_retries + 1})")
+        except Exception as e:
+            logger.warning(f"Error answering question (attempt {attempt + 1}/{max_retries + 1}): {e}")
+
+        if attempt < max_retries:
+            await asyncio.sleep(1.0 * (attempt + 1))
+
+    return None
+
+
+async def _answer_questions_batch_async(
+    question_messages: list[str],
+    client,
+    model: str,
+    system_prompt: str,
+    temperature: float = 0.0,
+    max_tokens: int = 256,
+    timeout: float = 60.0,
+    max_retries: int = 2,
+    max_concurrency: int = 32,
+) -> list[dict]:
+    """Answer questions in batch for caching (question-only, no caption)."""
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def process_one(question_message: str) -> dict:
+        async with semaphore:
+            if not question_message:
+                return {"question": "", "response": None}
+
+            response = await _answer_question_async(
+                client=client,
+                model=model,
+                question_message=question_message,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+            return {"question": question_message, "response": response}
+
+    tasks = [process_one(q) for q in question_messages]
+    return await asyncio.gather(*tasks)
+
+
+def precompute_question_cache(
+    dataframe: datasets.Dataset,
+    cache_path: str,
+    caption_config: dict,
+    prompt_key: str = "prompt",
+    force_regenerate: bool = False,
+) -> str:
+    """
+    Precompute question cache for CaptionReward after data filtering.
+
+    This caches the OpenAI API responses for QUESTION-ONLY queries (without caption).
+    CaptionReward compares:
+    - Question-only answer (can be cached, same for all epochs)
+    - Question+Caption answer (cannot be cached, depends on model output)
+
+    The cache stores: {question: formatted_question_message, response: openai_answer}
+
+    Args:
+        dataframe: Filtered HuggingFace Dataset
+        cache_path: Path to save the cache file (JSONL format)
+        caption_config: Configuration dict containing API settings
+        prompt_key: Key in dataframe containing the prompt/messages
+        force_regenerate: If True, regenerate even if cache exists
+
+    Returns:
+        Path to the cache file
+    """
+    # Check if cache already exists and is valid
+    print(f"[CACHE CHECK] cache_path={cache_path}, exists={os.path.exists(cache_path)}, force_regenerate={force_regenerate}")
+    if os.path.exists(cache_path) and not force_regenerate:
+        try:
+            existing_count = 0
+            valid_count = 0
+            with open(cache_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    existing_count += 1
+                    data = json.loads(line)
+                    if data.get("response") is not None:
+                        valid_count += 1
+
+            # If cache has enough valid entries, skip regeneration
+            # Use 80% threshold to avoid regeneration when dataset filtering varies slightly
+            threshold = len(dataframe) * 0.8
+            print(f"[CACHE CHECK] valid_count={valid_count}, threshold={threshold} (80% of {len(dataframe)})")
+            if valid_count >= threshold:  # 80% threshold
+                print(f"[CACHE CHECK] ✅ SKIPPING - Cache has {valid_count} valid entries >= {threshold}")
+                logger.info(f"Question cache exists with {valid_count}/{existing_count} valid entries (need {len(dataframe)}), skipping regeneration")
+                return cache_path
+            else:
+                print(f"[CACHE CHECK] ❌ REGENERATING - Cache has {valid_count} valid entries < {threshold}")
+                logger.info(f"Question cache has only {valid_count}/{existing_count} valid entries (need 80% of {len(dataframe)}={int(len(dataframe)*0.8)}), regenerating...")
+        except Exception as e:
+            print(f"[CACHE CHECK] ⚠️ Error reading cache: {e}")
+            logger.warning(f"Error reading existing cache: {e}, will regenerate")
+
+    # Get API configuration
+    api_key = caption_config.get("api_key")
+    if not api_key:
+        api_key_env = caption_config.get("api_key_env", "OPENAI_API_KEY")
+        api_key = os.environ.get(api_key_env)
+
+    if not api_key:
+        logger.warning("No API key found for question cache generation, skipping")
+        return cache_path
+
+    base_url = caption_config.get("base_url")
+    model = caption_config.get("model", "gpt-4o-mini")
+    max_concurrency = caption_config.get("max_concurrency", 32)
+    temperature = caption_config.get("temperature", 0.0)
+    max_tokens = caption_config.get("max_tokens", 256)
+    timeout = caption_config.get("timeout", 60.0)
+    max_retries = caption_config.get("max_retries", 2)
+
+    # CaptionReward's default templates - must match exactly!
+    system_prompt = caption_config.get(
+        "system_prompt",
+        "You are a careful and precise expert who solves multimodal reasoning tasks."
+    )
+    question_prompt_template = caption_config.get(
+        "question_prompt_template",
+        "Question:\n{question}\n\nProvide the best possible answer."
+    )
+
+    # Helper to extract question from prompt and remove image/video tags
+    # CaptionReward sends PURE TEXT questions to OpenAI (no image tags)
+    def extract_question(prompt_messages: list) -> str:
+        """Extract the user question from chat messages, removing image/video tags."""
+        import re
+        for msg in reversed(prompt_messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # Remove <image> and <video> tags for pure text question
+                    text = re.sub(r'<image>\s*', '', content)
+                    text = re.sub(r'<video>\s*', '', text)
+                    return text.strip()
+                elif isinstance(content, list):
+                    # Handle multimodal content format - only extract text parts
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                    return " ".join(text_parts).strip()
+                break
+        return ""
+
+    # Extract unique questions from dataframe
+    question_messages = []
+    seen_questions = set()
+    empty_questions = 0
+
+    for i in tqdm(range(len(dataframe)), desc="Extracting questions from prompts", disable=False):
+        row = dataframe[i]
+        messages = row.get(prompt_key, [])
+        question = extract_question(messages)
+
+        if question:
+            # Format as CaptionReward does
+            question_message = question_prompt_template.format(question=question)
+            if question_message not in seen_questions:
+                seen_questions.add(question_message)
+                question_messages.append(question_message)
+        else:
+            empty_questions += 1
+
+    logger.info(f"Found {len(question_messages)} unique questions to cache from {len(dataframe)} samples")
+    logger.info(f"Samples without questions: {empty_questions}")
+
+    if not question_messages:
+        logger.warning("No questions found in dataframe, skipping cache generation")
+        return cache_path
+
+    # Create async OpenAI client
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    except ImportError:
+        logger.error("openai package not installed, cannot generate question cache")
+        return cache_path
+
+    # Generate answers in batches with high concurrency per batch
+    # batch_size should match max_concurrency for optimal throughput
+    batch_size = max_concurrency
+    all_results = []
+
+    async def generate_all():
+        nonlocal all_results
+        num_batches = (len(question_messages) + batch_size - 1) // batch_size
+        logger.info(f"Generating answers for {len(question_messages)} questions in {num_batches} batches (batch_size={batch_size}, concurrency={max_concurrency})")
+
+        for batch_idx in tqdm(range(0, len(question_messages), batch_size),
+                              total=num_batches,
+                              desc="Generating question answers"):
+            batch = question_messages[batch_idx:batch_idx + batch_size]
+            results = await _answer_questions_batch_async(
+                question_messages=batch,
+                client=client,
+                model=model,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                max_retries=max_retries,
+                max_concurrency=max_concurrency,
+            )
+            all_results.extend(results)
+
+    # Run async generation
+    asyncio.run(generate_all())
+
+    # Save to cache file
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        for result in tqdm(all_results, desc="Saving cache to file", disable=False):
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    valid_count = sum(1 for r in all_results if r.get("response") is not None)
+    logger.info(f"Question cache saved to {cache_path} with {valid_count}/{len(all_results)} valid entries")
+
+    return cache_path
 
 
 def collate_fn(data_list: list[dict]) -> dict:
@@ -137,6 +394,10 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
 
+        # Caption cache configuration (for precomputing question cache after filtering)
+        self.caption_cache_config = config.get("caption_cache_config", None)
+        self.caption_cache_path = config.get("caption_cache_path", None)
+
         self._download()
         self._read_files_and_tokenize()
 
@@ -158,6 +419,34 @@ class RLHFDataset(Dataset):
         print(f"dataset len: {len(self.dataframe)}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+
+        # Precompute question cache AFTER filtering (if configured)
+        self._maybe_precompute_question_cache()
+
+    def _maybe_precompute_question_cache(self):
+        """
+        Precompute question cache for caption reward after data filtering.
+
+        This ensures we only generate questions for samples that will actually be used,
+        avoiding wasted API calls for filtered-out samples.
+        """
+        if self.caption_cache_config is None or self.caption_cache_path is None:
+            return
+
+        logger.info("Precomputing question cache after data filtering...")
+
+        # Convert DictConfig to dict if needed
+        caption_config = dict(self.caption_cache_config) if hasattr(self.caption_cache_config, 'items') else self.caption_cache_config
+
+        precompute_question_cache(
+            dataframe=self.dataframe,
+            cache_path=self.caption_cache_path,
+            caption_config=caption_config,
+            prompt_key=self.prompt_key,
+            force_regenerate=False,
+        )
+
+        logger.info(f"Question cache ready at: {self.caption_cache_path}")
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts

@@ -25,12 +25,16 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     assert_pkg_version,
-    get_ip,
     get_open_port,
     is_cuda,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+# Compatibility: get_ip was renamed to get_local_ip_auto in sglang 0.5.5+
+try:
+    from sglang.srt.utils import get_ip
+except ImportError:
+    from sglang.srt.utils import get_local_ip_auto as get_ip
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.net_utils import is_ipv6

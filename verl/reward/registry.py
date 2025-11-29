@@ -764,7 +764,7 @@ class CaptionReward(RewardFunction):
     DEFAULT_QUESTION_PROMPT = "Question:\n{question}\n\nProvide the best possible answer."
     DEFAULT_CAPTION_PROMPT = (
         "You are given a caption produced by another assistant that may help answer the question.\n"
-        "Caption:\n{caption}\n\nQuestion:\n{question}\n\nUse the caption if it is helpful; otherwise rely on your own reasoning."
+        "Caption:\n{caption}\n\nQuestion:\n{question}"
     )
 
     def __init__(
@@ -782,6 +782,9 @@ class CaptionReward(RewardFunction):
         timeout: Optional[float] = None,
         semantic_case_sensitive: bool = False,
         max_concurrency: int = 8,
+        question_cache_path: Optional[str] = None,
+        precompute_cache: bool = False,
+        train_files: Optional[List[str]] = None,
     ) -> None:
         if not model:
             raise ValueError("CaptionReward requires an OpenAI model name via 'model'.")
@@ -808,6 +811,210 @@ class CaptionReward(RewardFunction):
         self._client = None
         self._question_cache: Dict[str, str] = {}
         self._caption_cache: Dict[str, str] = {}
+        self.precompute_cache = precompute_cache
+        self.train_files = train_files
+
+        # Load precomputed question cache if provided
+        if question_cache_path and os.path.exists(question_cache_path):
+            self._load_question_cache(question_cache_path)
+
+        # Precompute cache if enabled and cache doesn't exist
+        # Check environment variable for precompute cache
+        precompute_env = os.getenv("PRECOMPUTE_QUESTION_CACHE", "false").lower() == "true"
+
+        if (precompute_env or precompute_cache) and question_cache_path and train_files:
+            if not os.path.exists(question_cache_path):
+                logger.info("Precomputing question cache from training data...")
+                self._precompute_question_cache(question_cache_path, train_files)
+
+    def _load_question_cache(self, cache_path: str) -> None:
+        """Load precomputed question cache from JSONL file."""
+        logger.info(f"Loading precomputed question cache from {cache_path}")
+        try:
+            loaded_count = 0
+            with open(cache_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if "question" in data and "response" in data and data["response"] is not None:
+                            self._question_cache[data["question"]] = data["response"]
+                            loaded_count += 1
+                    except json.JSONDecodeError:
+                        continue
+            logger.info(f"Loaded {loaded_count} precomputed question responses")
+        except Exception as e:
+            logger.warning(f"Failed to load question cache from {cache_path}: {e}")
+
+    def _precompute_question_cache(self, cache_path: str, train_files: List[str]) -> None:
+        """Precompute question cache from training data files."""
+        import asyncio
+        import aiohttp
+        from tqdm import tqdm
+
+        self._ensure_client()
+
+        # Extract all unique questions from training files
+        logger.info("Extracting unique questions from training data...")
+        unique_questions = self._extract_unique_questions(train_files)
+        logger.info(f"Found {len(unique_questions)} unique questions")
+
+        # Filter out questions already in cache
+        uncached_questions = [q for q in unique_questions if q not in self._question_cache]
+        logger.info(f"Need to generate responses for {len(uncached_questions)} questions")
+
+        if not uncached_questions:
+            logger.info("All questions are already cached!")
+            return
+
+        # Generate cache using async API calls
+        asyncio.run(self._generate_cache_async(uncached_questions, cache_path))
+
+    def _extract_unique_questions(self, train_files: List[str]) -> List[str]:
+        """Extract unique questions from training parquet files."""
+        unique_questions = set()
+
+        for file_path in train_files:
+            try:
+                import pandas as pd
+                df = pd.read_parquet(file_path)
+
+                for _, row in df.iterrows():
+                    # Extract prompt from numpy array
+                    prompt_list = row['prompt']
+                    if not isinstance(prompt_list, list):
+                        continue
+
+                    # Find the user message (question)
+                    for msg in prompt_list:
+                        if msg.get('role') == 'user':
+                            # Extract question after 'Question:\n'
+                            content = msg.get('content', '')
+                            if 'Question:\n' in content:
+                                question = content.split('Question:\n')[1].strip()
+                                unique_questions.add(question)
+                            break
+            except Exception as e:
+                logger.warning(f"Failed to extract questions from {file_path}: {e}")
+
+        return list(unique_questions)
+
+    async def _generate_cache_async(self, questions: List[str], cache_path: str) -> None:
+        """Generate cache using async API calls."""
+        import aiohttp
+        from tqdm import tqdm
+        import time
+
+        # Create output directory if needed
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+        connector = aiohttp.TCPConnector(limit=self.max_concurrency * 2)
+        timeout = aiohttp.ClientTimeout(total=60)
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        # Rate limiting
+        requests_per_second = 50
+        request_times = []
+
+        async def call_api(session: aiohttp.ClientSession, question: str) -> str:
+            async with semaphore:
+                # Rate limiting
+                now = time.time()
+                request_times[:] = [t for t in request_times if now - t < 1.0]
+                if len(request_times) >= requests_per_second:
+                    sleep_time = 1.0 - (now - request_times[0])
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+                request_times.append(now)
+
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+
+                data = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant. Please answer the question concisely and accurately."
+                        },
+                        {
+                            "role": "user",
+                            "content": question
+                        }
+                    ],
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                }
+
+                try:
+                    async with session.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json=data,
+                        timeout=timeout
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            return result["choices"][0]["message"]["content"]
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"API error. Status: {response.status}, Error: {error_text}")
+                            return None
+                except Exception as e:
+                    logger.error(f"Exception when calling API: {str(e)}")
+                    return None
+
+        # Save progress periodically
+        def save_progress():
+            temp_path = cache_path + ".tmp"
+            try:
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    for question, response in self._question_cache.items():
+                        f.write(json.dumps({"question": question, "response": response}) + "\n")
+                os.rename(temp_path, cache_path)
+            except Exception as e:
+                logger.error(f"Failed to save progress: {e}")
+
+        # Process all questions
+        success_count = 0
+        error_count = 0
+        save_interval = 100
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            tasks = []
+            for question in questions:
+                task = asyncio.create_task(call_api(session, question))
+                tasks.append((question, task))
+
+            with tqdm(total=len(questions), desc="Generating cache") as pbar:
+                for question, task in tasks:
+                    try:
+                        response = await task
+                        if response:
+                            self._question_cache[question] = response
+                            success_count += 1
+                        else:
+                            error_count += 1
+
+                        pbar.update(1)
+
+                        # Save progress periodically
+                        if (success_count + error_count) % save_interval == 0:
+                            save_progress()
+                            logger.info(f"Progress: {success_count + error_count}/{len(questions)} "
+                                      f"(Success: {success_count}, Errors: {error_count})")
+                    except Exception as e:
+                        logger.error(f"Error processing question: {str(e)}")
+                        error_count += 1
+                        pbar.update(1)
+
+        # Final save
+        save_progress()
+        logger.info(f"Cache generation complete! Success: {success_count}, Errors: {error_count}")
 
     def _ensure_client(self) -> None:
         if self._client is not None:
@@ -832,10 +1039,16 @@ class CaptionReward(RewardFunction):
 
     @staticmethod
     def _extract_question(prompt: str) -> str:
+        """Extract pure text question from prompt, removing image/video tags."""
         match = re.findall(r"<\|im_start\|>user\s*(.*?)<\|im_end\|>", prompt, re.DOTALL | re.IGNORECASE)
         if match:
-            return match[-1].strip()
-        return prompt.strip()
+            text = match[-1].strip()
+        else:
+            text = prompt.strip()
+        # Remove <image> and <video> tags for pure text question to OpenAI
+        text = re.sub(r'<image>\s*', '', text)
+        text = re.sub(r'<video>\s*', '', text)
+        return text.strip()
 
     @staticmethod
     def _extract_generated_answer(text: str) -> str:
@@ -898,7 +1111,9 @@ class CaptionReward(RewardFunction):
             finally:
                 loop.close()
 
-        return dict(zip(unique_messages, outputs))
+        result = dict(zip(unique_messages, outputs))
+
+        return result
 
     def _semantic_match(self, prediction: str, ground_truth: str) -> bool:
         from verl.utils.reward_score.search_r1_like_qa_em import normalize_answer

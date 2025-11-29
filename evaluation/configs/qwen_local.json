@@ -1,0 +1,43 @@
+{
+    "model": {
+        "QWEN25VL3B_LOCAL": {
+            "class": "Qwen2VLChat",
+            "model_path": "/root/wzh/rl/verl-plus/outputs/qwen25vl3b_car/hf_merged",
+            "max_new_tokens": 512
+        }
+    },
+    "data": {
+        "MMK12": {
+            "class": "CustomVQADataset",
+            "dataset": "MMK12"
+        },
+        "MathVista": {
+            "class": "MathVista",
+            "dataset": "MathVista"
+        },
+        "MathVision": {
+            "class": "MathVision",
+            "dataset": "MathVision"
+        },
+        "MathVerse": {
+            "class": "MathVerse",
+            "dataset": "MathVerse_MINI_Vision_Only"
+        },
+        "DynaMath": {
+            "class": "Dynamath",
+            "dataset": "DynaMath"
+        },
+        "WeMath": {
+            "class": "WeMath",
+            "dataset": "WeMath"
+        },
+        "LogicVista": {
+            "class": "LogicVista",
+            "dataset": "LogicVista"
+        },
+        "OlympiadBench": {
+            "class": "OlympiadBench",
+            "dataset": "OlympiadBench"
+        }
+    }
+}

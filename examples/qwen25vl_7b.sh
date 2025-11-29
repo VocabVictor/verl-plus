@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-MICROMAMBA_ROOT="$HOME/wzh/micromamba"
+MICROMAMBA_ROOT="/data/wzh/wzh/micromamba"
 MICROMAMBA_BIN="$MICROMAMBA_ROOT/bin/micromamba"
 
 if [[ ! -x "$MICROMAMBA_BIN" ]]; then
@@ -18,42 +18,32 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TOKENIZERS_PARALLELISM="true"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 unset PYTORCH_CUDA_ALLOC_CONF
-export PYTHONPATH="$HOME/wzh/verl-plus:${PYTHONPATH:-}"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME}"
 
-WORKDIR="$HOME/wzh/verl-plus"
-DATA_ROOT="$HOME/wzh/datasets/MM-EUREKA/verl"
+WORKDIR="/data/wzh/wzh/rl/verl-plus"
+export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
+DATA_ROOT="/data/wzh/wzh/datasets/MM-EUREKA/verl"
 TRAIN_PARQUET="$DATA_ROOT/train.parquet"
+VAL_PARQUET="$DATA_ROOT/val.parquet"
 if [[ ! -f "$TRAIN_PARQUET" ]]; then
   echo "Missing train parquet: $TRAIN_PARQUET" >&2
   exit 1
 fi
-
-DEFAULT_MODEL_PATH=""
-DEFAULT_MODEL_CANDIDATES=(
-  "/root/wzh/models/Qwen2.5-VL-3B-Instruct"
-  "/root/wzh/models/qwen/Qwen2.5-VL-3B-Instruct"
-  "/workspace/models/qwen/Qwen2.5-VL-3B-Instruct"
-)
-for candidate in "${DEFAULT_MODEL_CANDIDATES[@]}"; do
-  if [[ -d "$candidate" ]]; then
-    DEFAULT_MODEL_PATH="$candidate"
-    break
-  fi
-done
-if [[ -z "$DEFAULT_MODEL_PATH" ]]; then
-  DEFAULT_MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"
+if [[ ! -f "$VAL_PARQUET" ]]; then
+  echo "Missing val parquet: $VAL_PARQUET" >&2
+  exit 1
 fi
 
-MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
-OUTPUT_DIR="${OUTPUT_DIR:-$WORKDIR/outputs/qwen25vl3b_car}"
+# Force using local model path only; fail fast if missing (no HF fallback)
+MODEL_PATH="${MODEL_PATH:-/data/wzh/wzh/models/qwen/Qwen2.5-VL-7B-Instruct}"
+OUTPUT_DIR="${OUTPUT_DIR:-$WORKDIR/outputs/qwen25vl7b_grpo}"
 
-if [[ -d "$MODEL_PATH" ]]; then
-  echo "Using local model directory: $MODEL_PATH" >&2
-else
-  echo "Using remote HuggingFace model: $MODEL_PATH" >&2
+if [[ ! -d "$MODEL_PATH" ]]; then
+  echo "Local model directory not found: $MODEL_PATH" >&2
+  exit 1
 fi
+echo "Using local model directory: $MODEL_PATH" >&2
 
 mkdir -p "$OUTPUT_DIR"
 cd "$WORKDIR"
@@ -66,22 +56,23 @@ if [[ -f "$WORKDIR/.env" ]]; then
 fi
 
 TRAIN_FILES="['$TRAIN_PARQUET']"
+VAL_FILES="['$VAL_PARQUET']"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-aa3765e540d2c141804b236d76c1aa7a7b4ba04e}"
+export WANDB_API_KEY="${WANDB_API_KEY:?set WANDB_API_KEY before running}"
 export WANDB_MODE="online"
 
 OVERRIDES=(
   "algorithm.adv_estimator=grpo"
   "algorithm.use_kl_in_reward=False"
   "data.train_files=${TRAIN_FILES}"
-  "data.val_files=[]"
+  "data.val_files=${VAL_FILES}"
   "data.train_batch_size=256"
   "data.max_prompt_length=8192"
   "data.max_response_length=512"
   "data.filter_overlong_prompts=True"
   "data.truncation=right"
   "data.return_multi_modal_inputs=True"
-  "data.system_prompt_path=${WORKDIR}/prompt_caption.txt"
+  "data.system_prompt_path=${WORKDIR}/prompt.txt"
   "data.filter_overlong_prompts_workers=8"
   "actor_rollout_ref.model.path=${MODEL_PATH}"
   "actor_rollout_ref.model.trust_remote_code=True"
@@ -113,22 +104,17 @@ OVERRIDES=(
   "actor_rollout_ref.ref.fsdp_config.param_offload=True"
   "data.reward_fn_key=reward_model"
   "reward_model.reward_manager=rule"
-  "reward_model.reward_funcs=[\"format\",\"accuracy\",\"caption\"]"
-  "reward_model.reward_weights=[1.0,1.0,0.2]"
-  'reward_model.reward_kwargs.format.pattern="^<caption>.*?</caption>\s*<think>.*?</think>\s*<answer>.*?</answer>(?![\s\S])"'
-  "reward_model.reward_kwargs.caption.max_tokens=256"
-  "reward_model.reward_kwargs.caption.max_concurrency=16"
-  'reward_model.reward_kwargs.caption.base_url=${oc.env:OPENAI_BASE_URL,null}'
-  'reward_model.reward_kwargs.caption.model=${oc.env:OPENAI_MODEL_NAME,gpt-4o-mini}'
-  "algorithm.filter_groups.enable=True"
-  "algorithm.filter_groups.metric=acc"
+  "reward_model.reward_funcs=[\"format\",\"accuracy\"]"
+  "reward_model.reward_weights=[1.0,1.0]"
+  "algorithm.filter_groups.enable=False"
+  "algorithm.filter_groups.metric=accuracy"
   "algorithm.filter_groups.mode=std"
   "algorithm.filter_groups.mean_min=0.1"
   "algorithm.filter_groups.mean_max=null"
   "algorithm.filter_groups.warmup_steps=10"
   "algorithm.filter_groups.max_num_gen_batches=10"
-  "trainer.project_name=prime_mm_eureka"
-  "trainer.experiment_name=qwen25vl3b_car"
+  "trainer.project_name=cvpr"
+  "trainer.experiment_name=mm_eruka_qwen25vl_7b_grpo"
   "trainer.logger=[\"console\",\"wandb\"]"
   "trainer.n_gpus_per_node=8"
   "trainer.nnodes=1"
